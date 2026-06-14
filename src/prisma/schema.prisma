@@ -1,0 +1,246 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String  @id @default(cuid())
+  phone        String  @unique
+  displayName  String?
+  language     String  @default("am")
+  level        String  @default("beginner")
+  goal         String?
+  avatarUrl    String?
+  isPremium    Boolean @default(false)
+  referralCode String  @unique
+  referredById String?
+
+  referredBy User?  @relation("Referrals", fields: [referredById], references: [id])
+  referrals  User[] @relation("Referrals")
+
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  otpSessions       OtpSession[]
+  moduleProgress    UserModuleProgress[]
+  paperAccount      PaperAccount?
+  watchlistItems    WatchlistItem[]
+  priceAlerts       PriceAlert[]
+  subscription      Subscription?
+  pushSubscriptions PushSubscription[]
+  leaderboardSnaps  LeaderboardSnapshot[]
+
+  @@map("users")
+}
+
+model OtpSession {
+  id        String   @id @default(cuid())
+  phone     String
+  code      String
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [phone], references: [phone])
+
+  @@index([phone, createdAt])
+  @@map("otp_sessions")
+}
+
+model Subscription {
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  user             User      @relation(fields: [userId], references: [id])
+  status           String    @default("active")
+  plan             String    @default("monthly")
+  startedAt        DateTime  @default(now())
+  currentPeriodEnd DateTime
+  paymentMethod    String?
+  paymentReference String?
+  cancelledAt      DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@map("subscriptions")
+}
+
+model Module {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  titleAm       String
+  titleEn       String
+  descriptionAm String?
+  descriptionEn String?
+  type          String
+  track         String
+  orderIndex    Int
+  isPremium     Boolean  @default(false)
+  durationMin   Int?
+  videoUrl      String?
+  contentAm     String?
+  contentEn     String?
+  thumbnailUrl  String?
+  isPublished   Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  quizQuestions QuizQuestion[]
+  userProgress  UserModuleProgress[]
+
+  @@index([track, orderIndex])
+  @@map("modules")
+}
+
+model QuizQuestion {
+  id            String  @id @default(cuid())
+  moduleId      String
+  module        Module  @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  questionAm    String
+  questionEn    String
+  optionsAm     Json
+  optionsEn     Json
+  correctIndex  Int
+  explanationAm String?
+  explanationEn String?
+  orderIndex    Int
+
+  @@index([moduleId, orderIndex])
+  @@map("quiz_questions")
+}
+
+model UserModuleProgress {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  moduleId      String
+  module        Module    @relation(fields: [moduleId], references: [id])
+  status        String    @default("not_started")
+  quizScore     Int?
+  quizAttempts  Int       @default(0)
+  videoPosition Int       @default(0)
+  completedAt   DateTime?
+  lastAccessed  DateTime  @default(now())
+
+  @@unique([userId, moduleId])
+  @@map("user_module_progress")
+}
+
+model StockPrice {
+  id            String   @id @default(cuid())
+  symbol        String
+  nameEn        String
+  nameAm        String
+  sector        String?
+  currentPrice  BigInt
+  previousClose BigInt
+  openPrice     BigInt?
+  dayHigh       BigInt?
+  dayLow        BigInt?
+  volume        BigInt   @default(0)
+  tradingDate   DateTime @db.Date
+  updatedAt     DateTime @updatedAt
+
+  @@unique([symbol, tradingDate])
+  @@index([symbol])
+  @@map("stock_prices")
+}
+
+model PaperAccount {
+  id           String    @id @default(cuid())
+  userId       String    @unique
+  user         User      @relation(fields: [userId], references: [id])
+  cashBalance  BigInt    @default(5000000)
+  initialValue BigInt    @default(5000000)
+  resetCount   Int       @default(0)
+  lastResetAt  DateTime?
+  createdAt    DateTime  @default(now())
+
+  trades   PaperTrade[]
+  holdings PaperHolding[]
+
+  @@map("paper_accounts")
+}
+
+model PaperTrade {
+  id          String       @id @default(cuid())
+  accountId   String
+  account     PaperAccount @relation(fields: [accountId], references: [id])
+  symbol      String
+  side        String
+  quantity    Int
+  priceAtExec BigInt
+  totalValue  BigInt
+  executedAt  DateTime     @default(now())
+
+  @@index([accountId, executedAt(sort: Desc)])
+  @@map("paper_trades")
+}
+
+model PaperHolding {
+  id           String       @id @default(cuid())
+  accountId    String
+  account      PaperAccount @relation(fields: [accountId], references: [id])
+  symbol       String
+  quantity     Int
+  avgCostBasis BigInt
+  updatedAt    DateTime     @updatedAt
+
+  @@unique([accountId, symbol])
+  @@map("paper_holdings")
+}
+
+model WatchlistItem {
+  id      String   @id @default(cuid())
+  userId  String
+  user    User     @relation(fields: [userId], references: [id])
+  symbol  String
+  addedAt DateTime @default(now())
+
+  @@unique([userId, symbol])
+  @@map("watchlist_items")
+}
+
+model PriceAlert {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  symbol      String
+  condition   String
+  targetPrice BigInt
+  isActive    Boolean   @default(true)
+  triggeredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([isActive])
+  @@map("price_alerts")
+}
+
+model LeaderboardSnapshot {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  weekStart      DateTime @db.Date
+  portfolioValue BigInt
+  returnPct      Decimal  @db.Decimal(8, 4)
+  rank           Int?
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, weekStart])
+  @@index([weekStart, returnPct(sort: Desc)])
+  @@map("leaderboard_snapshots")
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@map("push_subscriptions")
+}
