@@ -3,37 +3,45 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "db:migrate": "prisma migrate dev",
-    "db:push": "prisma db push",
-    "db:studio": "prisma studio",
-    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev --schema=src/prisma/schema.prisma",
+    "db:push": "prisma db push --schema=src/prisma/schema.prisma",
+    "db:studio": "prisma studio --schema=src/prisma/schema.prisma",
+    "db:generate": "prisma generate --schema=src/prisma/schema.prisma",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@habexa/sdk": "file:../habexa-sdk",
     "@hono/node-server": "^1.13.7",
     "@hono/zod-validator": "^0.4.1",
-    "@prisma/client": "^5.21.0",
+    "@prisma/client": "^5.22.0",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.5",
-    "hono": "^4.6.3",
-    "ioredis": "^5.4.1",
+    "googleapis": "^148.0.0",
+    "hono": "^4.7.0",
+    "imagekit": "^5.2.0",
+    "ioredis": "^5.4.2",
+    "nodemailer": "^6.9.16",
     "web-push": "^3.6.7",
-    "zod": "^3.23.8"
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
-    "@types/node": "^20.16.0",
+    "@types/node": "^22.0.0",
+    "@types/nodemailer": "^6.4.17",
     "@types/web-push": "^3.6.3",
-    "@typescript-eslint/eslint-plugin": "^7.18.0",
-    "@typescript-eslint/parser": "^7.18.0",
-    "eslint": "^8.57.0",
-    "prisma": "^5.21.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "prisma": "^5.22.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.2"
+    "typescript": "^5.7.0"
   }
 }

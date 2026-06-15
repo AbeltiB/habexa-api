@@ -14,7 +14,7 @@ export const authMiddleware = createMiddleware<{ Variables: AuthVariables }>(asy
 
   const token = authHeader.slice(7)
   try {
-    const payload = await verify(token, process.env.JWT_SECRET!)
+    const payload = await verify(token, process.env.JWT_SECRET!, 'HS256')
     c.set('userId', payload.sub as string)
     c.set('isPremium', Boolean(payload.isPremium))
     await next()
