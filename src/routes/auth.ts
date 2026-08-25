@@ -18,6 +18,7 @@ import { requestOtp, verifyOtp, verifyOtpForUser, OtpRateLimitError } from '../l
 import { verifyTelegramAuth } from '../lib/telegram.js'
 import { verifyGoogleCredential } from '../lib/google.js'
 import { getAuthSettings } from '../lib/auth-settings.js'
+import { touchStreak } from '../lib/streaks.js'
 import { authMiddleware } from '../middleware/auth.js'
 import type { User } from '@prisma/client'
 
@@ -108,6 +109,7 @@ auth.post('/verify-otp', zValidator('json', VerifyOTPSchema), async (c) => {
     })
   }
 
+  await touchStreak(user.id).catch(() => {})
   const token = await signUserToken(user)
   return c.json({ data: { token, user, isNewUser, profileCompletion: profileCompletion(user) } })
 })
@@ -152,6 +154,7 @@ auth.post('/telegram/callback', zValidator('json', TelegramAuthSchema), async (c
     })
   }
 
+  await touchStreak(user.id).catch(() => {})
   const token = await signUserToken(user)
   return c.json({ data: { token, user, isNewUser, profileCompletion: profileCompletion(user) } })
 })
@@ -209,6 +212,7 @@ auth.post('/google/callback', zValidator('json', GoogleAuthSchema), async (c) =>
       .catch(() => {})
   }
 
+  await touchStreak(user.id).catch(() => {})
   const token = await signUserToken(user)
   return c.json({ data: { token, user, isNewUser, profileCompletion: profileCompletion(user) } })
 })

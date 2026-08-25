@@ -1,17 +1,37 @@
 import { Hono } from 'hono'
 import { authMiddleware, type AuthVariables } from '../middleware/auth.js'
 import { db } from '../lib/db.js'
+import type { StockPrice as PrismaStockPrice } from '@prisma/client'
 
 const market = new Hono<{ Variables: AuthVariables }>()
 
 market.use('*', authMiddleware)
+
+function toSummary(s: PrismaStockPrice) {
+  const changeAmount = s.currentPrice - s.previousClose
+  const changePct = s.previousClose > 0n
+    ? Number((changeAmount * 10000n) / s.previousClose) / 100
+    : 0
+  return {
+    symbol: s.symbol,
+    nameEn: s.nameEn,
+    nameAm: s.nameAm,
+    currentPrice: s.currentPrice,
+    previousClose: s.previousClose,
+    changeAmount,
+    changePct,
+    isGainer: changePct > 0,
+    isLoser: changePct < 0,
+    tradingDate: s.tradingDate,
+  }
+}
 
 market.get('/stocks', async (c) => {
   const stocks = await db.stockPrice.findMany({
     orderBy: { updatedAt: 'desc' },
     distinct: ['symbol'],
   })
-  return c.json({ data: stocks })
+  return c.json({ data: stocks.map(toSummary) })
 })
 
 market.get('/stocks/:symbol', async (c) => {
@@ -30,19 +50,12 @@ market.get('/movers', async (c) => {
     distinct: ['symbol'],
   })
 
-  const withChange = stocks.map(s => ({
-    ...s,
-    changePercent:
-      s.previousClose > 0n
-        ? Number((s.currentPrice - s.previousClose) * 10000n / s.previousClose) / 100
-        : 0,
-  }))
-
-  const sorted = [...withChange].sort((a, b) => b.changePercent - a.changePercent)
+  const summaries = stocks.map(toSummary)
+  const sorted = [...summaries].sort((a, b) => b.changePct - a.changePct)
   const gainers = sorted.slice(0, 3)
-  const losers = [...withChange].sort((a, b) => a.changePercent - b.changePercent).slice(0, 3)
+  const losers = [...summaries].sort((a, b) => a.changePct - b.changePct).slice(0, 3)
 
-  return c.json({ data: { gainers, losers } })
+  return c.json({ data: { gainers, losers, lastUpdated: new Date().toISOString() } })
 })
 
 export default market

@@ -25,6 +25,10 @@ model User {
   referralCode     String  @unique
   referredById     String?
 
+  currentStreak  Int       @default(0)
+  longestStreak  Int       @default(0)
+  lastActiveDate DateTime? @db.Date // EAT calendar date of last streak-counted activity
+
   referredBy User?  @relation("Referrals", fields: [referredById], references: [id])
   referrals  User[] @relation("Referrals")
 
@@ -38,8 +42,52 @@ model User {
   subscription      Subscription?
   pushSubscriptions PushSubscription[]
   leaderboardSnaps  LeaderboardSnapshot[]
+  badges            UserBadge[]
 
   @@map("users")
+}
+
+model Badge {
+  id            String   @id @default(cuid())
+  key           String   @unique // "first_trade" | "first_course" | "streak_7" | ...
+  nameEn        String
+  nameAm        String
+  descriptionEn String
+  descriptionAm String
+  icon          String   @default("🏅")
+  createdAt     DateTime @default(now())
+
+  users UserBadge[]
+
+  @@map("badges")
+}
+
+model UserBadge {
+  id       String   @id @default(cuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id])
+  badgeId  String
+  badge    Badge    @relation(fields: [badgeId], references: [id])
+  earnedAt DateTime @default(now())
+
+  @@unique([userId, badgeId])
+  @@map("user_badges")
+}
+
+// Append-only. Never update or delete a row here.
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String   // admin secret has no user id — "admin" for now, ready for real admin accounts later
+  action    String   // e.g. "module.publish", "price.update", "subscription.confirm"
+  entity    String   // e.g. "Module", "Subscription", "User"
+  entityId  String?
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
 }
 
 // Used for both first-time phone login (userId null) and linking/verifying
@@ -154,6 +202,9 @@ model StockPrice {
   nameEn        String
   nameAm        String
   sector        String?
+  lotSize       Int      @default(1)      // minimum tradeable unit (shares)
+  priceStep     BigInt   @default(1)      // minimum price increment, santims
+  status        String   @default("active") // "active" | "suspended" | "delisted"
   currentPrice  BigInt
   previousClose BigInt
   openPrice     BigInt?

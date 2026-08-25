@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
+import { PLAN_PRICES } from '@habexa/sdk'
 import { authMiddleware, type AuthVariables } from '../middleware/auth.js'
 import { db } from '../lib/db.js'
 
@@ -17,8 +18,6 @@ subscription.get('/', async (c) => {
   const sub = await db.subscription.findUnique({ where: { userId: c.get('userId') } })
   return c.json({ data: sub })
 })
-
-const PLAN_PRICES: Record<string, number> = { monthly: 15000, annual: 120000 } // santims
 
 function buildInstructions(plan: 'monthly' | 'annual'): string {
   const etb = (PLAN_PRICES[plan] / 100).toFixed(2)

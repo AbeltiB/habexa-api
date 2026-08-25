@@ -3,6 +3,8 @@ import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { authMiddleware, type AuthVariables } from '../middleware/auth.js'
 import { db } from '../lib/db.js'
+import { touchStreak } from '../lib/streaks.js'
+import { checkFirstModuleBadge, checkStreakBadge } from '../lib/badges.js'
 
 const modules = new Hono<{ Variables: AuthVariables }>()
 
@@ -90,6 +92,12 @@ modules.post('/:slug/progress', zValidator('json', progressSchema), async (c) =>
     },
   })
 
+  if (body.status === 'completed') {
+    const { currentStreak } = await touchStreak(userId)
+    checkFirstModuleBadge(userId).catch(() => {})
+    checkStreakBadge(userId, currentStreak).catch(() => {})
+  }
+
   return c.json({ data: progress })
 })
 
@@ -131,6 +139,12 @@ modules.post('/:slug/quiz', zValidator('json', quizSchema), async (c) => {
       ...(passed ? { status: 'completed', completedAt: new Date() } : {}),
     },
   })
+
+  if (passed) {
+    const { currentStreak } = await touchStreak(userId)
+    checkFirstModuleBadge(userId).catch(() => {})
+    checkStreakBadge(userId, currentStreak).catch(() => {})
+  }
 
   return c.json({ data: { score, passed, results } })
 })

@@ -3,6 +3,8 @@ import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { authMiddleware, type AuthVariables } from '../middleware/auth.js'
 import { db } from '../lib/db.js'
+import { touchStreak } from '../lib/streaks.js'
+import { checkFirstTradeBadge, checkStreakBadge } from '../lib/badges.js'
 
 const paper = new Hono<{ Variables: AuthVariables }>()
 
@@ -85,8 +87,18 @@ paper.post('/trade', zValidator('json', tradeSchema), async (c) => {
     orderBy: { tradingDate: 'desc' },
   })
   if (!stockPrice) return c.json({ error: 'Stock not found' }, 404)
+  if (stockPrice.status !== 'active') {
+    return c.json({ error: `${symbol} is not currently tradeable (${stockPrice.status})`, code: 'TRADE_STOCK_NOT_FOUND' }, 400)
+  }
+  if (quantity % stockPrice.lotSize !== 0) {
+    return c.json({ error: `Quantity must be a multiple of the lot size (${stockPrice.lotSize})` }, 400)
+  }
 
   const price = stockPrice.currentPrice
+  if (stockPrice.priceStep > 0n && price % stockPrice.priceStep !== 0n) {
+    // Admin-set price violates the instrument's price step — a data problem, not a user error.
+    return c.json({ error: `${symbol}'s current price is not aligned to its price step — contact support` }, 409)
+  }
   const totalValue = price * BigInt(quantity)
 
   try {
@@ -150,6 +162,10 @@ paper.post('/trade', zValidator('json', tradeSchema), async (c) => {
         data: { accountId: account.id, symbol, side, quantity, priceAtExec: price, totalValue },
       })
     })
+
+    const { currentStreak } = await touchStreak(userId)
+    checkFirstTradeBadge(userId).catch(() => {})
+    checkStreakBadge(userId, currentStreak).catch(() => {})
 
     return c.json({ data: trade }, 201)
   } catch (err) {

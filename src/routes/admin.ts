@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { adminMiddleware } from '../middleware/admin.js'
@@ -12,11 +12,16 @@ import {
 } from '../lib/imagekit.js'
 import { uploadToYouTube, type YouTubeVisibility } from '../lib/youtube.js'
 import { getAuthSettings, updateAuthSettings, AuthSettingsError } from '../lib/auth-settings.js'
-import { UpdateAuthSettingsSchema, getLeaderboardWeekStart } from '@habexa/sdk'
+import { writeAuditLog } from '../lib/audit.js'
+import { UpdateAuthSettingsSchema, getLeaderboardWeekStart, PLAN_PRICES } from '@habexa/sdk'
 
 const admin = new Hono()
 
 admin.use('*', adminMiddleware)
+
+// Admin auth is a single shared secret, not per-admin accounts (see CLAUDE.md) —
+// there's no real actor identity to log beyond "the holder of ADMIN_SECRET".
+const ADMIN_ACTOR_ID = 'admin'
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
@@ -35,6 +40,7 @@ admin.get('/dashboard/stats', async (c) => {
   const [
     totalUsers, premiumUsers, activeToday, totalModules, pendingSubs, revenueResult,
     inactiveCount, newUsersToday, d7Cohort,
+    usersWithModule, usersWithTrade,
   ] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isPremium: true } }),
@@ -51,10 +57,12 @@ admin.get('/dashboard/stats', async (c) => {
       where: { createdAt: { gte: cohortStart, lt: cohortEnd } },
       select: { createdAt: true, lastSeenAt: true },
     }),
+    // funnel: signup -> first module -> first trade -> premium
+    db.user.count({ where: { moduleProgress: { some: { status: 'completed' } } } }),
+    db.user.count({ where: { paperAccount: { trades: { some: {} } } } }),
   ])
 
-  const PLAN_PRICES: Record<string, number> = { monthly: 15000, annual: 120000 }
-  const revenueMtd = revenueResult.reduce((sum, s) => sum + (PLAN_PRICES[s.plan] ?? 0), 0)
+  const revenueMtd = revenueResult.reduce((sum, s) => sum + (PLAN_PRICES[s.plan as keyof typeof PLAN_PRICES] ?? 0), 0)
 
   const d7Retained = d7Cohort.filter(
     (u) => u.lastSeenAt.getTime() >= u.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000,
@@ -73,6 +81,12 @@ admin.get('/dashboard/stats', async (c) => {
       newUsersToday,
       d7Retention,
       conversionRate: totalUsers > 0 ? Number(((premiumUsers / totalUsers) * 100).toFixed(1)) : 0,
+      funnel: {
+        signedUp: totalUsers,
+        firstModule: usersWithModule,
+        firstTrade: usersWithTrade,
+        premium: premiumUsers,
+      },
     },
   })
 })
@@ -212,8 +226,9 @@ admin.get('/users/:id', async (c) => {
 })
 
 admin.post('/users/:id/reset-paper', async (c) => {
+  const userId = c.req.param('id')
   const user = await db.user.findUnique({
-    where: { id: c.req.param('id') },
+    where: { id: userId },
     include: { paperAccount: true },
   })
   if (!user?.paperAccount) return c.json({ error: 'Paper account not found' }, 404)
@@ -225,11 +240,13 @@ admin.post('/users/:id/reset-paper', async (c) => {
       data: { cashBalance: 5000000n, resetCount: { increment: 1 }, lastResetAt: new Date() },
     }),
   ])
+  writeAuditLog({ actorId: ADMIN_ACTOR_ID, action: 'user.reset_paper', entity: 'User', entityId: userId }).catch(() => {})
   return c.json({ data: { success: true } })
 })
 
 admin.post('/users/:id/cancel-subscription', async (c) => {
-  const sub = await db.subscription.findUnique({ where: { userId: c.req.param('id') } })
+  const userId = c.req.param('id')
+  const sub = await db.subscription.findUnique({ where: { userId } })
   if (!sub) return c.json({ error: 'Subscription not found' }, 404)
 
   await db.$transaction([
@@ -237,8 +254,12 @@ admin.post('/users/:id/cancel-subscription', async (c) => {
       where: { id: sub.id },
       data: { status: 'cancelled', cancelledAt: new Date() },
     }),
-    db.user.update({ where: { id: c.req.param('id') }, data: { isPremium: false } }),
+    db.user.update({ where: { id: userId }, data: { isPremium: false } }),
   ])
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'subscription.cancel', entity: 'Subscription', entityId: sub.id,
+    before: { status: sub.status }, after: { status: 'cancelled' },
+  }).catch(() => {})
   return c.json({ data: { success: true } })
 })
 
@@ -250,7 +271,8 @@ admin.post('/users/:id/push', zValidator('json', z.object({
   url: z.string().optional(),
 })), async (c) => {
   const { titleEn, bodyEn, url } = c.req.valid('json')
-  const subs = await db.pushSubscription.findMany({ where: { userId: c.req.param('id') } })
+  const userId = c.req.param('id')
+  const subs = await db.pushSubscription.findMany({ where: { userId } })
 
   await Promise.allSettled(
     subs.map((s) =>
@@ -260,6 +282,10 @@ admin.post('/users/:id/push', zValidator('json', z.object({
       ),
     ),
   )
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'user.push', entity: 'User', entityId: userId,
+    after: { titleEn, sentTo: subs.length },
+  }).catch(() => {})
   return c.json({ data: { sent: subs.length } })
 })
 
@@ -341,6 +367,7 @@ admin.post('/modules', zValidator('json', moduleSchema.extend({
     },
     include: { quizQuestions: true },
   })
+  writeAuditLog({ actorId: ADMIN_ACTOR_ID, action: 'module.create', entity: 'Module', entityId: mod.id, after: mod }).catch(() => {})
   return c.json({ data: mod }, 201)
 })
 
@@ -349,6 +376,8 @@ admin.put('/modules/:id', zValidator('json', moduleSchema.partial().extend({
 })), async (c) => {
   const { questions, ...moduleData } = c.req.valid('json')
   const id = c.req.param('id')
+
+  const before = await db.module.findUnique({ where: { id } })
 
   const mod = await db.$transaction(async (tx) => {
     const updated = await tx.module.update({ where: { id }, data: moduleData })
@@ -362,45 +391,36 @@ admin.put('/modules/:id', zValidator('json', moduleSchema.partial().extend({
     }
     return updated
   })
+  writeAuditLog({ actorId: ADMIN_ACTOR_ID, action: 'module.update', entity: 'Module', entityId: id, before, after: mod }).catch(() => {})
   return c.json({ data: mod })
 })
 
 admin.delete('/modules/:id', async (c) => {
-  await db.module.delete({ where: { id: c.req.param('id') } })
+  const id = c.req.param('id')
+  const before = await db.module.findUnique({ where: { id } })
+  await db.module.delete({ where: { id } })
+  writeAuditLog({ actorId: ADMIN_ACTOR_ID, action: 'module.delete', entity: 'Module', entityId: id, before }).catch(() => {})
   return c.json({ data: { success: true } })
 })
 
-admin.post('/modules/:id/publish', async (c) => {
-  const mod = await db.module.update({
-    where: { id: c.req.param('id') },
-    data: { isPublished: true },
-  })
+async function setModulePublished(c: Context, published: boolean) {
+  const id = c.req.param('id')
+  const mod = await db.module.update({ where: { id }, data: { isPublished: published } })
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID,
+    action: published ? 'module.publish' : 'module.unpublish',
+    entity: 'Module',
+    entityId: id,
+    after: { isPublished: published },
+  }).catch(() => {})
   return c.json({ data: mod })
-})
+}
 
-admin.put('/modules/:id/publish', async (c) => {
-  const mod = await db.module.update({
-    where: { id: c.req.param('id') },
-    data: { isPublished: true },
-  })
-  return c.json({ data: mod })
-})
-
-admin.post('/modules/:id/unpublish', async (c) => {
-  const mod = await db.module.update({
-    where: { id: c.req.param('id') },
-    data: { isPublished: false },
-  })
-  return c.json({ data: mod })
-})
-
-admin.put('/modules/:id/unpublish', async (c) => {
-  const mod = await db.module.update({
-    where: { id: c.req.param('id') },
-    data: { isPublished: false },
-  })
-  return c.json({ data: mod })
-})
+// Accept both POST and PUT from the admin client
+admin.post('/modules/:id/publish', (c) => setModulePublished(c, true))
+admin.put('/modules/:id/publish', (c) => setModulePublished(c, true))
+admin.post('/modules/:id/unpublish', (c) => setModulePublished(c, false))
+admin.put('/modules/:id/unpublish', (c) => setModulePublished(c, false))
 
 // ── Prices ────────────────────────────────────────────────────────────────────
 
@@ -409,6 +429,9 @@ const priceRowSchema = z.object({
   nameEn: z.string().min(1),
   nameAm: z.string().min(1),
   sector: z.string().optional(),
+  lotSize: z.number().int().positive().optional(),
+  priceStep: z.number().int().positive().optional(),
+  status: z.enum(['active', 'suspended', 'delisted']).optional(),
   currentPrice: z.number().int().positive(),
   previousClose: z.number().int().positive(),
   openPrice: z.number().int().positive().optional(),
@@ -428,6 +451,9 @@ function buildPriceUpsert(u: z.infer<typeof priceRowSchema>, tradingDate: Date) 
       nameEn: u.nameEn,
       nameAm: u.nameAm,
       sector: u.sector,
+      lotSize: u.lotSize ?? 1,
+      priceStep: BigInt(u.priceStep ?? 1),
+      status: u.status ?? 'active',
       currentPrice: BigInt(u.currentPrice),
       previousClose: BigInt(u.previousClose),
       openPrice: u.openPrice != null ? BigInt(u.openPrice) : null,
@@ -439,6 +465,9 @@ function buildPriceUpsert(u: z.infer<typeof priceRowSchema>, tradingDate: Date) 
     update: {
       nameEn: u.nameEn,
       nameAm: u.nameAm,
+      ...(u.lotSize != null ? { lotSize: u.lotSize } : {}),
+      ...(u.priceStep != null ? { priceStep: BigInt(u.priceStep) } : {}),
+      ...(u.status != null ? { status: u.status } : {}),
       currentPrice: BigInt(u.currentPrice),
       previousClose: BigInt(u.previousClose),
       openPrice: u.openPrice != null ? BigInt(u.openPrice) : null,
@@ -461,6 +490,10 @@ admin.put('/prices', zValidator('json', z.object({ prices: priceUpdateSchema }))
   const { prices } = c.req.valid('json')
   const tradingDate = new Date(prices[0].tradingDate)
   const results = await db.$transaction(prices.map((u) => buildPriceUpsert(u, tradingDate)))
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'price.update', entity: 'StockPrice',
+    after: { symbols: prices.map((p) => p.symbol), tradingDate: prices[0].tradingDate },
+  }).catch(() => {})
   return c.json({ data: { updated: results.length } })
 })
 
@@ -525,6 +558,10 @@ admin.post('/prices/csv/confirm', zValidator('json', z.object({ prices: priceUpd
   const { prices } = c.req.valid('json')
   const tradingDate = new Date(prices[0].tradingDate)
   const results = await db.$transaction(prices.map((u) => buildPriceUpsert(u, tradingDate)))
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'price.csv_import', entity: 'StockPrice',
+    after: { symbols: prices.map((p) => p.symbol), tradingDate: prices[0].tradingDate },
+  }).catch(() => {})
   return c.json({ data: { updated: results.length } })
 })
 
@@ -540,7 +577,7 @@ admin.get('/subscriptions', async (c) => {
   return c.json({ data: subs })
 })
 
-admin.post('/subscriptions/:id/confirm', async (c) => {
+async function confirmSubscription(c: Context) {
   const sub = await db.subscription.findUniqueOrThrow({
     where: { id: c.req.param('id') },
     include: { user: true },
@@ -557,42 +594,34 @@ admin.post('/subscriptions/:id/confirm', async (c) => {
     db.user.update({ where: { id: sub.userId }, data: { isPremium: true } }),
   ])
 
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'subscription.confirm', entity: 'Subscription', entityId: sub.id,
+    before: { status: sub.status }, after: { status: 'active', currentPeriodEnd: periodEnd },
+  }).catch(() => {})
+
   sendAdminNotification(
     'Subscription confirmed',
     `<strong>${sub.user.displayName ?? sub.user.phone}</strong> subscription confirmed.<br>Plan: ${sub.plan} · Expires: ${periodEnd.toDateString()}`,
   ).catch(() => {})
 
   return c.json({ data: { success: true } })
-})
+}
 
-// Accept both POST and PUT from admin client
-admin.put('/subscriptions/:id/confirm', async (c) => {
-  const sub = await db.subscription.findUniqueOrThrow({ where: { id: c.req.param('id') } })
-  const monthsToAdd = sub.plan === 'annual' ? 12 : 1
-  const periodEnd = new Date()
-  periodEnd.setMonth(periodEnd.getMonth() + monthsToAdd)
-
-  await db.$transaction([
-    db.subscription.update({
-      where: { id: sub.id },
-      data: { status: 'active', currentPeriodEnd: periodEnd },
-    }),
-    db.user.update({ where: { id: sub.userId }, data: { isPremium: true } }),
-  ])
-  return c.json({ data: { success: true } })
-})
-
-admin.post('/subscriptions/:id/reject', async (c) => {
+async function rejectSubscription(c: Context) {
   const sub = await db.subscription.findUniqueOrThrow({ where: { id: c.req.param('id') } })
   await db.subscription.update({ where: { id: sub.id }, data: { status: 'rejected' } })
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'subscription.reject', entity: 'Subscription', entityId: sub.id,
+    before: { status: sub.status }, after: { status: 'rejected' },
+  }).catch(() => {})
   return c.json({ data: { success: true } })
-})
+}
 
-admin.put('/subscriptions/:id/reject', async (c) => {
-  const sub = await db.subscription.findUniqueOrThrow({ where: { id: c.req.param('id') } })
-  await db.subscription.update({ where: { id: sub.id }, data: { status: 'rejected' } })
-  return c.json({ data: { success: true } })
-})
+// Accept both POST and PUT from the admin client
+admin.post('/subscriptions/:id/confirm', confirmSubscription)
+admin.put('/subscriptions/:id/confirm', confirmSubscription)
+admin.post('/subscriptions/:id/reject', rejectSubscription)
+admin.put('/subscriptions/:id/reject', rejectSubscription)
 
 // ── Push notifications ────────────────────────────────────────────────────────
 
@@ -635,6 +664,11 @@ admin.post('/push/broadcast', zValidator('json', broadcastSchema), async (c) => 
       }
     }),
   )
+
+  writeAuditLog({
+    actorId: ADMIN_ACTOR_ID, action: 'push.broadcast', entity: 'PushSubscription',
+    after: { titleEn, segment, sent, failed, total: subs.length },
+  }).catch(() => {})
 
   return c.json({ data: { sent, failed, total: subs.length } })
 })
@@ -747,13 +781,39 @@ admin.get('/auth-settings', async (c) => {
 })
 
 admin.put('/auth-settings', zValidator('json', UpdateAuthSettingsSchema), async (c) => {
+  const before = await getAuthSettings()
   try {
     const settings = await updateAuthSettings(c.req.valid('json'))
+    writeAuditLog({
+      actorId: ADMIN_ACTOR_ID, action: 'auth_settings.update', entity: 'AuthSettings',
+      before, after: settings,
+    }).catch(() => {})
     return c.json({ data: settings })
   } catch (e) {
     if (e instanceof AuthSettingsError) return c.json({ error: e.message, code: 'VALIDATION_ERROR' }, 400)
     throw e
   }
+})
+
+// ── Audit log ──────────────────────────────────────────────────────────────────
+
+admin.get('/audit-log', async (c) => {
+  const page = Math.max(1, Number(c.req.query('page') ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Number(c.req.query('pageSize') ?? 50)))
+  const entity = c.req.query('entity')
+
+  const where = entity ? { entity } : undefined
+  const [entries, total] = await Promise.all([
+    db.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    db.auditLog.count({ where }),
+  ])
+
+  return c.json({ data: { entries, total, page, pageSize } })
 })
 
 export default admin
