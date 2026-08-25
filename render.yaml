@@ -16,36 +16,60 @@ services:
         sync: false
       - key: UPSTASH_REDIS_URL
         sync: false
-      - key: UPSTASH_REDIS_TOKEN
-        sync: false
       - key: JWT_SECRET
         sync: false
       - key: ADMIN_SECRET
         sync: false
-      - key: AFROSMS_API_KEY
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: AFROSMS_SENDER_ID
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: AFROSMS_TOKEN
+        sync: false
+      - key: AFROSMS_OTP_URL
+        sync: false
+      - key: AFROSMS_OTP_FROM
         value: HABEXA
+      - key: AFROSMS_OTP_SENDER
+        value: Habexa
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        value: "Habexa <noreply@habexa.com>"
+      - key: IMAGEKIT_PUBLIC_KEY
+        sync: false
+      - key: IMAGEKIT_PRIVATE_KEY
+        sync: false
+      - key: IMAGEKIT_URL_ENDPOINT
+        sync: false
+      - key: YOUTUBE_CLIENT_ID
+        sync: false
+      - key: YOUTUBE_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_REFRESH_TOKEN
+        sync: false
       - key: VAPID_PUBLIC_KEY
         sync: false
       - key: VAPID_PRIVATE_KEY
         sync: false
       - key: VAPID_SUBJECT
         value: mailto:admin@habexa.com
-      - key: CLOUDFLARE_ACCOUNT_ID
-        sync: false
-      - key: CLOUDFLARE_STREAM_API_TOKEN
-        sync: false
-      - key: CLOUDFLARE_R2_ACCESS_KEY
-        sync: false
-      - key: CLOUDFLARE_R2_SECRET_KEY
-        sync: false
-      - key: CLOUDFLARE_R2_BUCKET
-        value: habexa-media
-      - key: RESEND_API_KEY
-        sync: false
       - key: ADMIN_EMAIL
         value: admin@habexa.com
+      - key: BANK_NAME
+        sync: false
+      - key: BANK_ACCOUNT_NAME
+        sync: false
+      - key: BANK_ACCOUNT_NUMBER
+        sync: false
       - key: API_URL
         value: https://api.habexa.com
       - key: WEB_URL

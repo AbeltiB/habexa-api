@@ -11,6 +11,8 @@ import {
   getImageKitAuthParams,
 } from '../lib/imagekit.js'
 import { uploadToYouTube, type YouTubeVisibility } from '../lib/youtube.js'
+import { getAuthSettings, updateAuthSettings, AuthSettingsError } from '../lib/auth-settings.js'
+import { UpdateAuthSettingsSchema, getLeaderboardWeekStart } from '@habexa/sdk'
 
 const admin = new Hono()
 
@@ -18,53 +20,46 @@ admin.use('*', adminMiddleware)
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
-admin.get('/dashboard', async (c) => {
-  const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
-  const today = new Date(); today.setHours(0, 0, 0, 0)
-  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1)
-
-  const [totalUsers, premiumUsers, activeToday, totalModules, pendingSubs, revenueResult] =
-    await Promise.all([
-      db.user.count(),
-      db.user.count({ where: { isPremium: true } }),
-      db.user.count({ where: { lastSeenAt: { gte: today } } }),
-      db.module.count({ where: { isPublished: true } }),
-      db.subscription.count({ where: { status: 'pending' } }),
-      db.subscription.findMany({
-        where: { status: 'active', startedAt: { gte: monthStart } },
-        select: { plan: true },
-      }),
-    ])
-
-  const PLAN_PRICES: Record<string, number> = { monthly: 15000, annual: 120000 }
-  const revenueMtd = revenueResult.reduce((sum, s) => sum + (PLAN_PRICES[s.plan] ?? 0), 0)
-
-  return c.json({
-    data: { totalUsers, premiumUsers, activeToday, totalModules, pendingSubs, revenueMtd },
-  })
-})
-
 admin.get('/dashboard/stats', async (c) => {
   const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
   const today = new Date(); today.setHours(0, 0, 0, 0)
   const monthStart = new Date(today.getFullYear(), today.getMonth(), 1)
 
-  const [totalUsers, premiumUsers, activeToday, totalModules, pendingSubs, revenueResult, inactiveCount] =
-    await Promise.all([
-      db.user.count(),
-      db.user.count({ where: { isPremium: true } }),
-      db.user.count({ where: { lastSeenAt: { gte: today } } }),
-      db.module.count({ where: { isPublished: true } }),
-      db.subscription.count({ where: { status: 'pending' } }),
-      db.subscription.findMany({
-        where: { status: 'active', startedAt: { gte: monthStart } },
-        select: { plan: true },
-      }),
-      db.user.count({ where: { lastSeenAt: { lt: fourteenDaysAgo } } }),
-    ])
+  // D7 retention proxy: of users who signed up 7-8 days ago, what % came back at
+  // least once a week after signing up? (We only store lastSeenAt, not a full
+  // activity log, so "came back on exactly day 7" isn't knowable — this is the
+  // closest honest approximation available from the current schema.)
+  const cohortStart = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+  const cohortEnd = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+
+  const [
+    totalUsers, premiumUsers, activeToday, totalModules, pendingSubs, revenueResult,
+    inactiveCount, newUsersToday, d7Cohort,
+  ] = await Promise.all([
+    db.user.count(),
+    db.user.count({ where: { isPremium: true } }),
+    db.user.count({ where: { lastSeenAt: { gte: today } } }),
+    db.module.count({ where: { isPublished: true } }),
+    db.subscription.count({ where: { status: 'pending' } }),
+    db.subscription.findMany({
+      where: { status: 'active', startedAt: { gte: monthStart } },
+      select: { plan: true },
+    }),
+    db.user.count({ where: { lastSeenAt: { lt: fourteenDaysAgo } } }),
+    db.user.count({ where: { createdAt: { gte: today } } }),
+    db.user.findMany({
+      where: { createdAt: { gte: cohortStart, lt: cohortEnd } },
+      select: { createdAt: true, lastSeenAt: true },
+    }),
+  ])
 
   const PLAN_PRICES: Record<string, number> = { monthly: 15000, annual: 120000 }
   const revenueMtd = revenueResult.reduce((sum, s) => sum + (PLAN_PRICES[s.plan] ?? 0), 0)
+
+  const d7Retained = d7Cohort.filter(
+    (u) => u.lastSeenAt.getTime() >= u.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000,
+  ).length
+  const d7Retention = d7Cohort.length > 0 ? Number(((d7Retained / d7Cohort.length) * 100).toFixed(1)) : 0
 
   return c.json({
     data: {
@@ -75,6 +70,8 @@ admin.get('/dashboard/stats', async (c) => {
       pendingSubs,
       revenueMtd,
       inactiveUsers: inactiveCount,
+      newUsersToday,
+      d7Retention,
       conversionRate: totalUsers > 0 ? Number(((premiumUsers / totalUsers) * 100).toFixed(1)) : 0,
     },
   })
@@ -147,23 +144,71 @@ admin.get('/users', async (c) => {
 })
 
 admin.get('/users/:id', async (c) => {
+  const id = c.req.param('id')
   const user = await db.user.findUnique({
-    where: { id: c.req.param('id') },
+    where: { id },
     include: {
       subscription: true,
       paperAccount: {
         include: {
           holdings: true,
-          _count: { select: { trades: true } },
+          trades: { select: { id: true } },
         },
       },
-      _count: {
-        select: { moduleProgress: { where: { status: 'completed' } } },
-      },
+      moduleProgress: { select: { status: true, quizScore: true } },
     },
   })
   if (!user) return c.json({ error: 'User not found' }, 404)
-  return c.json({ data: user })
+
+  const [totalModules, weekSnapshot] = await Promise.all([
+    db.module.count({ where: { isPublished: true } }),
+    db.leaderboardSnapshot.findUnique({
+      where: { userId_weekStart: { userId: id, weekStart: getLeaderboardWeekStart() } },
+      select: { rank: true },
+    }),
+  ])
+
+  const modulesCompleted = user.moduleProgress.filter((p) => p.status === 'completed').length
+  const scored = user.moduleProgress.filter((p) => p.quizScore != null)
+  const avgQuizScore = scored.length > 0
+    ? Math.round(scored.reduce((sum, p) => sum + (p.quizScore ?? 0), 0) / scored.length)
+    : null
+
+  let portfolioValue: string | null = null
+  let portfolioGainPct: number | null = null
+  if (user.paperAccount) {
+    const symbols = [...new Set(user.paperAccount.holdings.map((h) => h.symbol))]
+    const prices = symbols.length > 0
+      ? await db.stockPrice.findMany({ where: { symbol: { in: symbols } }, select: { symbol: true, currentPrice: true } })
+      : []
+    const priceMap = new Map(prices.map((p) => [p.symbol, p.currentPrice]))
+    const holdingsValue = user.paperAccount.holdings.reduce(
+      (sum, h) => sum + BigInt(h.quantity) * (priceMap.get(h.symbol) ?? 0n),
+      0n,
+    )
+    const totalValue = user.paperAccount.cashBalance + holdingsValue
+    portfolioValue = totalValue.toString()
+    portfolioGainPct = user.paperAccount.initialValue > 0n
+      ? Number(((Number(totalValue - user.paperAccount.initialValue) / Number(user.paperAccount.initialValue)) * 100).toFixed(2))
+      : 0
+  }
+
+  const { moduleProgress: _moduleProgress, ...userFields } = user
+
+  return c.json({
+    data: {
+      ...userFields,
+      stats: {
+        modulesCompleted,
+        totalModules,
+        avgQuizScore,
+        portfolioValue,
+        portfolioGainPct,
+        totalTrades: user.paperAccount?.trades.length ?? 0,
+        rank: weekSnapshot?.rank ?? null,
+      },
+    },
+  })
 })
 
 admin.post('/users/:id/reset-paper', async (c) => {
@@ -272,6 +317,15 @@ admin.get('/modules', async (c) => {
     },
   })
   return c.json({ data: mods })
+})
+
+admin.get('/modules/:id', async (c) => {
+  const mod = await db.module.findUnique({
+    where: { id: c.req.param('id') },
+    include: { quizQuestions: { orderBy: { orderIndex: 'asc' } } },
+  })
+  if (!mod) return c.json({ error: 'Module not found' }, 404)
+  return c.json({ data: mod })
 })
 
 admin.post('/modules', zValidator('json', moduleSchema.extend({
@@ -410,6 +464,12 @@ admin.put('/prices', zValidator('json', z.object({ prices: priceUpdateSchema }))
   return c.json({ data: { updated: results.length } })
 })
 
+// The CSV is filled in by hand, so prices are entered as whole-ETB decimals
+// (e.g. 850.00). Everywhere else in the system (including the price table's own
+// bulk-update payload) prices travel as integer santims — convert once here, at
+// the one point actual human-typed decimal input enters the system.
+const etbToSantims = (n: number) => Math.round(n * 100)
+
 // CSV upload: parse and return preview (does not save)
 admin.post('/prices/csv', async (c) => {
   const formData = await c.req.formData()
@@ -426,19 +486,36 @@ admin.post('/prices/csv', async (c) => {
     return headers.reduce<Record<string, string>>((obj, h, i) => ({ ...obj, [h]: vals[i] ?? '' }), {})
   })
 
+  // The common case is updating an already-listed symbol, so nameEn/nameAm are
+  // optional in the CSV — backfill them from the existing row when omitted.
+  const symbols = [...new Set(rows.map((r) => (r.symbol ?? '').trim().toUpperCase()).filter(Boolean))]
+  const existing = symbols.length > 0
+    ? await db.stockPrice.findMany({ where: { symbol: { in: symbols } }, distinct: ['symbol'], select: { symbol: true, nameEn: true, nameAm: true, sector: true } })
+    : []
+  const existingBySymbol = new Map(existing.map((s) => [s.symbol, s]))
+
   const parsed = priceUpdateSchema.safeParse(
-    rows.map((r) => ({
-      ...r,
-      currentPrice: Number(r.current_price ?? r.currentPrice),
-      previousClose: Number(r.previous_close ?? r.previousClose),
-      openPrice: r.open_price ?? r.openPrice ? Number(r.open_price ?? r.openPrice) : undefined,
-      dayHigh: r.day_high ?? r.dayHigh ? Number(r.day_high ?? r.dayHigh) : undefined,
-      dayLow: r.day_low ?? r.dayLow ? Number(r.day_low ?? r.dayLow) : undefined,
-      volume: r.volume ? Number(r.volume) : undefined,
-      tradingDate: r.trading_date ?? r.tradingDate ?? new Date().toISOString().slice(0, 10),
-    })),
+    rows.map((r) => {
+      const openPriceEtb = r.open_price ?? r.openPrice
+      const dayHighEtb = r.day_high ?? r.dayHigh
+      const dayLowEtb = r.day_low ?? r.dayLow
+      const known = existingBySymbol.get((r.symbol ?? '').trim().toUpperCase())
+      return {
+        ...r,
+        nameEn: r.nameEn || r.name_en || known?.nameEn,
+        nameAm: r.nameAm || r.name_am || known?.nameAm,
+        sector: r.sector || known?.sector || undefined,
+        currentPrice: etbToSantims(Number(r.current_price ?? r.currentPrice)),
+        previousClose: etbToSantims(Number(r.previous_close ?? r.previousClose)),
+        openPrice: openPriceEtb ? etbToSantims(Number(openPriceEtb)) : undefined,
+        dayHigh: dayHighEtb ? etbToSantims(Number(dayHighEtb)) : undefined,
+        dayLow: dayLowEtb ? etbToSantims(Number(dayLowEtb)) : undefined,
+        volume: r.volume ? Number(r.volume) : undefined,
+        tradingDate: r.trading_date ?? r.tradingDate ?? new Date().toISOString().slice(0, 10),
+      }
+    }),
   )
-  if (!parsed.success) return c.json({ error: 'Invalid CSV data', details: parsed.error.flatten() }, 400)
+  if (!parsed.success) return c.json({ error: 'Invalid CSV data — for a new symbol, include name_en and name_am columns', details: parsed.error.flatten() }, 400)
 
   return c.json({ data: { preview: parsed.data } })
 })
@@ -573,7 +650,7 @@ admin.get('/upload/auth', (c) => {
   try {
     const params = getImageKitAuthParams()
     return c.json({ data: { ...params, publicKey: process.env.IMAGEKIT_PUBLIC_KEY } })
-  } catch (e) {
+  } catch {
     return c.json({ error: 'ImageKit not configured' }, 503)
   }
 })
@@ -658,6 +735,25 @@ admin.delete('/upload/file', zValidator('json', z.object({ fileId: z.string().mi
   const { fileId } = c.req.valid('json')
   await deleteFromImageKit(fileId)
   return c.json({ data: { success: true } })
+})
+
+// ── Auth settings ─────────────────────────────────────────────────────────────
+// Toggling a method off only blocks *new* logins through it — existing JWTs are
+// stateless and stay valid until they naturally expire.
+
+admin.get('/auth-settings', async (c) => {
+  const settings = await getAuthSettings()
+  return c.json({ data: settings })
+})
+
+admin.put('/auth-settings', zValidator('json', UpdateAuthSettingsSchema), async (c) => {
+  try {
+    const settings = await updateAuthSettings(c.req.valid('json'))
+    return c.json({ data: settings })
+  } catch (e) {
+    if (e instanceof AuthSettingsError) return c.json({ error: e.message, code: 'VALIDATION_ERROR' }, 400)
+    throw e
+  }
 })
 
 export default admin

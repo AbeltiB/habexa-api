@@ -24,6 +24,7 @@
     "@prisma/client": "^5.22.0",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.5",
+    "google-auth-library": "^9.15.0",
     "googleapis": "^148.0.0",
     "hono": "^4.7.0",
     "imagekit": "^5.2.0",

@@ -8,16 +8,22 @@ datasource db {
 }
 
 model User {
-  id           String  @id @default(cuid())
-  phone        String  @unique
-  displayName  String?
-  language     String  @default("am")
-  level        String  @default("beginner")
-  goal         String?
-  avatarUrl    String?
-  isPremium    Boolean @default(false)
-  referralCode String  @unique
-  referredById String?
+  id               String  @id @default(cuid())
+  phone            String? @unique
+  phoneVerified    Boolean @default(false)
+  email            String? @unique
+  emailVerified    Boolean @default(false)
+  telegramId       String? @unique
+  telegramUsername String?
+  googleId         String? @unique
+  displayName      String?
+  language         String  @default("am")
+  level            String  @default("beginner")
+  goal             String?
+  avatarUrl        String?
+  isPremium        Boolean @default(false)
+  referralCode     String  @unique
+  referredById     String?
 
   referredBy User?  @relation("Referrals", fields: [referredById], references: [id])
   referrals  User[] @relation("Referrals")
@@ -25,7 +31,6 @@ model User {
   createdAt  DateTime @default(now())
   lastSeenAt DateTime @default(now())
 
-  otpSessions       OtpSession[]
   moduleProgress    UserModuleProgress[]
   paperAccount      PaperAccount?
   watchlistItems    WatchlistItem[]
@@ -37,19 +42,34 @@ model User {
   @@map("users")
 }
 
+// Used for both first-time phone login (userId null) and linking/verifying
+// phone or email on an already-authenticated account (userId set, channel set).
 model OtpSession {
   id        String   @id @default(cuid())
-  phone     String
+  channel   String   @default("phone") // "phone" | "email"
+  target    String   // phone number or email address the code was sent to
+  userId    String?  // set when verifying/linking against an existing session, not logging in fresh
   code      String
   expiresAt DateTime
   verified  Boolean  @default(false)
   attempts  Int      @default(0)
   createdAt DateTime @default(now())
 
-  user User? @relation(fields: [phone], references: [phone])
-
-  @@index([phone, createdAt])
+  @@index([channel, target, createdAt])
   @@map("otp_sessions")
+}
+
+// Singleton row (application-enforced) controlling which login methods are offered.
+// Disabling a method blocks new logins through it but never invalidates existing sessions —
+// JWTs are stateless and carry no provider check.
+model AuthSettings {
+  id                  String   @id @default(cuid())
+  phoneAuthEnabled    Boolean  @default(true)
+  googleAuthEnabled   Boolean  @default(true)
+  telegramAuthEnabled Boolean  @default(true)
+  updatedAt           DateTime @updatedAt
+
+  @@map("auth_settings")
 }
 
 model Subscription {

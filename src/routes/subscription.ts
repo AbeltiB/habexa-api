@@ -18,6 +18,20 @@ subscription.get('/', async (c) => {
   return c.json({ data: sub })
 })
 
+const PLAN_PRICES: Record<string, number> = { monthly: 15000, annual: 120000 } // santims
+
+function buildInstructions(plan: 'monthly' | 'annual'): string {
+  const etb = (PLAN_PRICES[plan] / 100).toFixed(2)
+  const bankName = process.env.BANK_NAME
+  const accountName = process.env.BANK_ACCOUNT_NAME
+  const accountNumber = process.env.BANK_ACCOUNT_NUMBER
+
+  if (!bankName || !accountName || !accountNumber) {
+    return `Transfer ETB ${etb} to the Habexa bank account (contact support for details), then submit the transaction reference below. An admin will confirm within 24 hours.`
+  }
+  return `Transfer ETB ${etb} to ${bankName}, account name "${accountName}", account number ${accountNumber}. Then submit the transaction reference below — an admin will confirm within 24 hours.`
+}
+
 subscription.post('/initiate', zValidator('json', initiateSchema), async (c) => {
   const userId = c.get('userId')
   const { plan, paymentMethod } = c.req.valid('json')
@@ -30,7 +44,7 @@ subscription.post('/initiate', zValidator('json', initiateSchema), async (c) => 
     update: { plan, paymentMethod, status: 'pending', currentPeriodEnd, cancelledAt: null },
   })
 
-  return c.json({ data: sub }, 201)
+  return c.json({ data: { ...sub, instructions: buildInstructions(plan) } }, 201)
 })
 
 subscription.delete('/', async (c) => {

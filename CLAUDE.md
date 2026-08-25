@@ -2,10 +2,10 @@
 
 ## What this repo is
 
-The REST API server for Habexa. It is the single backend that serves all clients: `habexa-web`, `habexa-admin`, and `habexa-mobile`. It handles authentication, business logic, and database access. Background jobs are handled by `habexa-worker` (separate repo, same Railway service).
+The REST API server for Habexa. It is the single backend that serves all clients: `habexa-web`, `habexa-admin`, and `habexa-mobile`. It handles authentication, business logic, and database access. Background jobs are handled by `habexa-worker` (separate repo, separate Render service — shares the same DB/Redis).
 
 **URL:** `https://api.habexa.com`
-**Runtime:** Node.js 20 LTS on Railway
+**Runtime:** Node.js 20 LTS on Render
 **Framework:** Hono.js
 
 ---
@@ -20,8 +20,12 @@ The REST API server for Habexa. It is the single backend that serves all clients
 | @habexa/sdk | latest | Shared types and validators |
 | jsonwebtoken / hono/jwt | built-in | JWT signing and verification |
 | bcryptjs | ^2.x | OTP hashing |
+| google-auth-library | ^9.x | Google Sign-In ID token verification |
 | web-push | ^3.x | Browser push notifications |
 | ioredis | ^5.x | Redis client |
+| nodemailer | ^6.x | Transactional email (SMTP) |
+| imagekit | ^5.x | Media storage/delivery |
+| googleapis | ^148.x | YouTube upload (module video hosting) |
 
 ---
 
@@ -32,17 +36,17 @@ habexa-api/
 ├── src/
 │   ├── index.ts                  Entry point — Hono app, middleware, route mounting
 │   ├── routes/
-│   │   ├── auth.ts               POST /auth/request-otp, /auth/verify-otp, DELETE /auth/session
+│   │   ├── auth.ts               Phone/Telegram/Google login, method toggles, phone/email linking (see Routes Reference)
 │   │   ├── user.ts               GET|PUT /api/user/me, POST /api/user/onboarding
 │   │   ├── modules.ts            GET /api/modules, GET /api/modules/:slug, POST progress + quiz
 │   │   ├── paper.ts              GET|POST /api/paper/account|/trade|/trades|/reset
 │   │   ├── market.ts             GET /api/market/stocks, /:symbol, /movers
 │   │   ├── leaderboard.ts        GET /api/leaderboard, /history
-│   │   ├── watchlist.ts          GET|POST|DELETE /api/watchlist/:symbol
+│   │   ├── watchlist.ts          GET|POST|DELETE /api/watchlist/:symbol (enriched with live price/change)
 │   │   ├── alerts.ts             GET|POST|DELETE /api/alerts/:id
 │   │   ├── subscription.ts       GET|POST|DELETE /api/subscription
 │   │   ├── push.ts               POST /api/push/subscribe, /unsubscribe
-│   │   └── admin.ts              All /admin/* routes (price update, module CRUD, sub confirm)
+│   │   └── admin.ts              All /admin/* routes (price update, module CRUD, sub confirm, auth-settings)
 │   ├── middleware/
 │   │   ├── auth.ts               JWT verification → sets userId, isPremium on context
 │   │   ├── admin.ts              Admin secret cookie verification
@@ -52,8 +56,14 @@ habexa-api/
 │   │   ├── db.ts                 Prisma client singleton
 │   │   ├── redis.ts              Upstash Redis client singleton
 │   │   ├── afrosms.ts            sendOTP(phone, code) → void
+│   │   ├── otp.ts                requestOtp/verifyOtp/verifyOtpForUser — shared phone+email OTP sessions
+│   │   ├── telegram.ts           verifyTelegramAuth — Login Widget hash verification
+│   │   ├── google.ts             verifyGoogleCredential — ID token verification
+│   │   ├── auth-settings.ts      getAuthSettings/updateAuthSettings — per-method on/off toggles
 │   │   ├── push.ts               sendPushNotification(sub, payload) → void
-│   │   ├── resend.ts             sendEmail(to, subject, html) → void (admin alerts)
+│   │   ├── email.ts              sendOTPEmail, sendWelcomeEmail, sendSubscription*Email, etc. (Nodemailer/SMTP)
+│   │   ├── imagekit.ts           uploadToImageKit, deleteFromImageKit (media storage)
+│   │   ├── youtube.ts            uploadToYouTube (alt video hosting)
 │   │   └── crypto.ts             hashCode, verifyCode (OTP hashing)
 │   └── prisma/
 │       └── schema.prisma         Database schema (source of truth)
@@ -72,6 +82,9 @@ habexa-api/
 ### Public Routes (no auth)
 
 ```
+GET    /auth/methods
+       Response: { data: AuthSettings }  // which of phone/google/telegram are enabled
+
 POST   /auth/request-otp
        Body: { phone: string }           // +251XXXXXXXXX
        Response: { data: { success: true, expiresIn: 300 } }
@@ -79,15 +92,34 @@ POST   /auth/request-otp
 
 POST   /auth/verify-otp
        Body: { phone: string, code: string }
-       Response: { data: { token: string, user: User, isNewUser: boolean } }
+       Response: { data: { token, user: User, isNewUser: boolean, profileCompletion } }
+
+POST   /auth/telegram/callback
+       Body: TelegramAuthInput          // raw payload from the Telegram Login Widget callback
+       Response: { data: { token, user: User, isNewUser: boolean, profileCompletion } }
+       Verifies the widget's hash against TELEGRAM_BOT_TOKEN server-side.
+
+POST   /auth/google/callback
+       Body: { credential: string }     // Google Identity Services ID token
+       Response: { data: { token, user: User, isNewUser: boolean, profileCompletion } }
+       If the verified email already belongs to an existing account, links googleId to it
+       instead of creating a duplicate user.
 
 GET    /health
        Response: { status: "ok", ts: number }
 ```
 
+`profileCompletion` = `{ needsDisplayName, needsPhone, needsEmailVerification }` — drives whether
+the web client routes to `/onboarding` after login, and which step it shows there.
+
 ### Protected Routes (Bearer JWT required)
 
 ```
+POST   /auth/phone/request-otp          Body: { phone } — link/verify a phone on the current account
+POST   /auth/phone/verify-otp           Body: { code }
+POST   /auth/email/request-otp          Body: { email } — link/verify an email on the current account
+POST   /auth/email/verify-otp           Body: { code }
+
 GET    /api/user/me
 PUT    /api/user/me                      Body: { displayName?, language?, avatarUrl? }
 POST   /api/user/onboarding             Body: { displayName, language, level, goal }
@@ -134,11 +166,15 @@ GET    /admin/users                     Query: ?page&search&isPremium
 GET    /admin/users/:id
 
 GET    /admin/modules
+GET    /admin/modules/:id
 POST   /admin/modules                   Create new module
 PUT    /admin/modules/:id               Update module
 DELETE /admin/modules/:id
 POST   /admin/modules/:id/publish
 POST   /admin/modules/:id/unpublish
+
+GET    /admin/auth-settings             { phoneAuthEnabled, googleAuthEnabled, telegramAuthEnabled }
+PUT    /admin/auth-settings             Body: Partial<AuthSettings> — at least one method must stay enabled
 
 GET    /admin/prices                    All stocks with last update time
 PUT    /admin/prices                    Body: StockPriceUpdate[] (bulk update)
@@ -178,22 +214,27 @@ datasource db {
 }
 
 model User {
-  id              String    @id @default(cuid())
-  phone           String    @unique
-  displayName     String?
-  language        String    @default("am")
-  level           String    @default("beginner")
-  goal            String?
-  avatarUrl       String?
-  isPremium       Boolean   @default(false)
-  referralCode    String    @unique
-  referredById    String?
-  referredBy      User?     @relation("Referrals", fields: [referredById], references: [id])
-  referrals       User[]    @relation("Referrals")
-  createdAt       DateTime  @default(now())
-  lastSeenAt      DateTime  @default(now())
+  id               String  @id @default(cuid())
+  phone            String? @unique   // null until linked — Telegram/Google signups start without one
+  phoneVerified    Boolean @default(false)
+  email            String? @unique
+  emailVerified    Boolean @default(false)
+  telegramId       String? @unique
+  telegramUsername String?
+  googleId         String? @unique
+  displayName      String?
+  language         String  @default("am")
+  level            String  @default("beginner")
+  goal             String?
+  avatarUrl        String?
+  isPremium        Boolean @default(false)
+  referralCode     String  @unique
+  referredById     String?
+  referredBy       User?     @relation("Referrals", fields: [referredById], references: [id])
+  referrals        User[]    @relation("Referrals")
+  createdAt        DateTime  @default(now())
+  lastSeenAt       DateTime  @default(now())
 
-  otpSessions       OtpSession[]
   moduleProgress    UserModuleProgress[]
   paperAccount      PaperAccount?
   watchlistItems    WatchlistItem[]
@@ -205,18 +246,34 @@ model User {
   @@map("users")
 }
 
+// Used for first-time phone login (userId null) AND for linking/verifying a
+// phone or email on an already-authenticated account (userId + channel set).
 model OtpSession {
-  id         String   @id @default(cuid())
-  phone      String
-  code       String
-  expiresAt  DateTime
-  verified   Boolean  @default(false)
-  attempts   Int      @default(0)
-  createdAt  DateTime @default(now())
-  user       User?    @relation(fields: [phone], references: [phone])
+  id        String   @id @default(cuid())
+  channel   String   @default("phone") // "phone" | "email"
+  target    String   // phone number or email address the code was sent to
+  userId    String?  // set only for the authenticated link/verify flow
+  code      String
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
 
-  @@index([phone, createdAt])
+  @@index([channel, target, createdAt])
   @@map("otp_sessions")
+}
+
+// Singleton row (app-enforced) controlling which login methods are offered.
+// Toggling a method off blocks new logins through it but never invalidates
+// already-issued JWTs — auth is stateless, there's no session to revoke.
+model AuthSettings {
+  id                  String   @id @default(cuid())
+  phoneAuthEnabled    Boolean  @default(true)
+  googleAuthEnabled   Boolean  @default(true)
+  telegramAuthEnabled Boolean  @default(true)
+  updatedAt           DateTime @updatedAt
+
+  @@map("auth_settings")
 }
 
 model Subscription {
@@ -445,36 +502,56 @@ model PushSubscription {
 ## Environment Variables
 
 ```bash
-# Database
+# Database (Supabase PostgreSQL)
 DATABASE_URL=postgresql://user:password@host:5432/habexa?schema=public
 
-# Redis (Upstash)
+# Redis (Upstash) — only the connection URL is used, not a separate token
 UPSTASH_REDIS_URL=rediss://default:token@host:port
-UPSTASH_REDIS_TOKEN=your-token
 
 # Auth
 JWT_SECRET=minimum-32-character-random-secret-here
 ADMIN_SECRET=separate-admin-dashboard-secret
 
-# Afro SMS
-AFROSMS_API_KEY=your-key
-AFROSMS_SENDER_ID=HABEXA
+# Telegram Login Widget (default sign-in) — bot token from @BotFather
+TELEGRAM_BOT_TOKEN=123456:your-bot-token
+
+# Google Sign-In — OAuth Web client ID (no secret needed for ID-token verification)
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+
+# Afro SMS (phone OTP + phone-linking verification)
+AFROSMS_TOKEN=your-bearer-token
+AFROSMS_OTP_URL=https://api.afrosms.com/v1/send
+AFROSMS_OTP_FROM=HABEXA
+AFROSMS_OTP_SENDER=Habexa
+
+# Email (Nodemailer / SMTP — any provider)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=your@gmail.com
+SMTP_PASS=your-app-password
+SMTP_FROM=Habexa <noreply@habexa.com>
+ADMIN_EMAIL=admin@habexa.com
+
+# ImageKit (media storage/delivery)
+IMAGEKIT_PUBLIC_KEY=public_xxxxxxxxxxxxxxxxxxxx
+IMAGEKIT_PRIVATE_KEY=private_xxxxxxxxxxxxxxxxxxxx
+IMAGEKIT_URL_ENDPOINT=https://ik.imagekit.io/your-id
+
+# YouTube (alt video hosting — optional)
+YOUTUBE_CLIENT_ID=your-google-oauth-client-id
+YOUTUBE_CLIENT_SECRET=your-google-oauth-client-secret
+YOUTUBE_REFRESH_TOKEN=your-one-time-authorized-refresh-token
 
 # Web Push (generate with: npx web-push generate-vapid-keys)
 VAPID_PUBLIC_KEY=your-public-key
 VAPID_PRIVATE_KEY=your-private-key
 VAPID_SUBJECT=mailto:admin@habexa.com
 
-# Cloudflare
-CLOUDFLARE_ACCOUNT_ID=your-account-id
-CLOUDFLARE_STREAM_API_TOKEN=your-token
-CLOUDFLARE_R2_ACCESS_KEY=your-key
-CLOUDFLARE_R2_SECRET_KEY=your-secret
-CLOUDFLARE_R2_BUCKET=habexa-media
-
-# Resend (email)
-RESEND_API_KEY=your-key
-ADMIN_EMAIL=admin@habexa.com
+# Manual bank transfer (launch payment rail) — shown in the upgrade flow
+BANK_NAME=
+BANK_ACCOUNT_NAME=
+BANK_ACCOUNT_NUMBER=
 
 # App
 NODE_ENV=production
@@ -492,11 +569,15 @@ TELEBIRR_API_KEY=
 ## Key Business Logic Rules
 
 **OTP:**
+- Shared logic in `lib/otp.ts` for both channels — `channel: 'phone' | 'email'`
 - Code is 6 digits, numeric only
 - Store HASHED (bcrypt) — never plain text
 - Expires in 5 minutes
 - Max 5 wrong attempts before session invalidated
-- Max 3 OTP requests per phone per 10 minutes
+- Max 3 OTP requests per (channel, target) pair per 10 minutes
+- Login flow (`request-otp`/`verify-otp`): target is looked up directly, no `userId`
+- Link flow (`phone|email/request-otp`/`verify-otp`, authenticated): session is scoped to the
+  current `userId` so verify doesn't need the target re-sent — just the code
 
 **Paper Trading:**
 - All trade execution must happen inside a `db.$transaction()` — never partial writes
